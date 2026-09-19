@@ -35,14 +35,21 @@ Logic:
 
 Output:
   A single .xlsx with three sheets:
-    - "Seating Plan": First name | Last name | Table number | Dietary | Submitter email
+    - "Seating Plan": First name | Last name | Table number | Dietary | Submitter email | Duplicate table(s)
+      Rows are highlighted if the same guest ends up seated at more than
+      one table (a likely double submission) - this can happen if the
+      same person is listed as an attendee in two different preference
+      submissions. The "Duplicate table(s)" column lists every table that
+      guest was seated at, so you can see the conflict at a glance and
+      manually decide which table is correct.
     - "Needs Review": First name | Last name | Order ID | Dietary | Submitter email | Reason
       Rows are highlighted where that specific person is the actual reason
       the group is held back (e.g. their Order ID/name/phone didn't match
       anything) - other rows in the same group are shown plain, since
       they're only there because the group is kept together, not because
       something's wrong with them individually. A group-size mismatch has
-      no single culprit, so no row is highlighted in that case.
+      no single culprit, so instead the whole group is highlighted a
+      different color to flag the headcount problem itself.
     - "No Submission": First name | Last name | Order ID | Dietary
       (guests on the guest list who were never referenced - by Order ID,
       name, or phone - anywhere in the preferences file)
@@ -55,6 +62,7 @@ USAGE
 """
 
 import re
+import difflib
 import pandas as pd
 import openpyxl
 
@@ -157,6 +165,38 @@ def load_guest_list(path):
     return df, by_order_id, by_name, by_phone
 
 
+def best_fuzzy_match(target, candidates, min_ratio=0.82, min_gap=0.08):
+    """
+    Pick the single candidate whose normalized name is closest to target,
+    but only if it's a clear, confident best match - not a coin-flip
+    between two similarly-close names. Returns the row or None.
+    """
+    if not target or not candidates:
+        return None
+    scored = sorted(
+        ((difflib.SequenceMatcher(None, target, c["_name_norm"]).ratio(), c) for c in candidates),
+        key=lambda x: -x[0],
+    )
+    if not scored or scored[0][0] < min_ratio:
+        return None
+    if len(scored) > 1 and (scored[0][0] - scored[1][0]) < min_gap:
+        return None  # too close to call - don't guess
+    return scored[0][1]
+
+
+def names_plausibly_match(target, candidate_name_norm, min_ratio=0.6):
+    """Loose sanity check: does a typed name plausibly belong to this
+    candidate, allowing for typos, but ruling out a totally different
+    person (e.g. someone who typed a stranger's/relative's order ID)?"""
+    if not target or not candidate_name_norm:
+        return True  # nothing to contradict the order ID, so trust it
+    if target == candidate_name_norm:
+        return True
+    if target in candidate_name_norm or candidate_name_norm in target:
+        return True
+    return difflib.SequenceMatcher(None, target, candidate_name_norm).ratio() >= min_ratio
+
+
 def match_guest(order_id, name, phone, by_order_id, by_name, by_phone):
     """
     Match priority: Order ID -> full Name -> Phone Number.
@@ -172,17 +212,29 @@ def match_guest(order_id, name, phone, by_order_id, by_name, by_phone):
     When not confident, first/last/dietary are None so the caller falls
     back to the name as typed in the preferences file (never borrows
     another attendee's details).
+
+    IMPORTANT: even a single-candidate Order ID match is sanity-checked
+    against the typed name. An Order ID with only one ticket under it is
+    NOT automatically trusted if a completely different name was typed
+    against it (e.g. someone mistyped/reused another attendee's order
+    ID) - in that case we fall through to name/phone matching instead of
+    silently attaching the wrong person's identity and dietary info.
     """
+    order_id_name_conflict = None  # set if a single order-id candidate's name doesn't match
+
     # --- 1. Order ID -----------------------------------------------------
     oid = norm_order_id(order_id)
     candidates = by_order_id.get(oid, [])
+    target = norm_name(name)
 
     if len(candidates) == 1:
         row = candidates[0]
-        return row["First name"], row["Last name"], row["_dietary"], None, True, "order id", [row.name]
+        if names_plausibly_match(target, row["_name_norm"]):
+            return row["First name"], row["Last name"], row["_dietary"], None, True, "order id", [row.name]
+        else:
+            order_id_name_conflict = f"{row['First name']} {row['Last name']}"
 
     if len(candidates) > 1:
-        target = norm_name(name)
         exact = [c for c in candidates if c["_name_norm"] == target]
         if len(exact) == 1:
             row = exact[0]
@@ -193,8 +245,11 @@ def match_guest(order_id, name, phone, by_order_id, by_name, by_phone):
             row = partial[0]
             return row["First name"], row["Last name"], row["_dietary"], None, True, "order id + partial name", [row.name]
 
+        fuzzy = best_fuzzy_match(target, candidates)
+        if fuzzy is not None:
+            return fuzzy["First name"], fuzzy["Last name"], fuzzy["_dietary"], None, True, "order id + fuzzy name", [fuzzy.name]
+
     # --- 2. Full name, across the whole guest list ------------------------
-    target = norm_name(name)
     name_candidates = by_name.get(target, [])
     if len(name_candidates) == 1:
         row = name_candidates[0]
@@ -208,14 +263,19 @@ def match_guest(order_id, name, phone, by_order_id, by_name, by_phone):
         return row["First name"], row["Last name"], row["_dietary"], None, True, "phone", [row.name]
 
     # --- Nothing worked confidently ----------------------------------------
-    if not candidates and not name_candidates and not phone_candidates:
+    all_touched = candidates + name_candidates + phone_candidates
+    if order_id_name_conflict:
+        reason = (
+            f"Order ID '{order_id}' belongs to '{order_id_name_conflict}' in the guest list, not "
+            f"'{name}' - likely a data-entry error (wrong/reused order ID), please verify manually"
+        )
+    elif not all_touched:
         reason = "Order ID, name and phone number all failed to match the guest list"
-        touched_ids = []
     else:
         reason = "Order ID, name and/or phone number match more than one guest - could not confirm, please verify"
-        # even though ambiguous, these specific rows WERE referenced by the
-        # preferences file, so they shouldn't be flagged as "no submission"
-        touched_ids = [c.name for c in candidates] + [c.name for c in name_candidates] + [c.name for c in phone_candidates]
+    # even though unresolved, these specific rows WERE referenced by the
+    # preferences file, so they shouldn't be flagged as "no submission"
+    touched_ids = [c.name for c in all_touched]
     return None, None, "", reason, False, None, touched_ids
 
 
@@ -299,6 +359,7 @@ def allocate(submissions, by_order_id, by_name, by_phone, total_tables=TOTAL_TAB
             matched_attendees.append({
                 "first": first, "last": last, "oid": oid, "dietary": dietary,
                 "reason": reason, "matched": matched, "method": method,
+                "row_id": row_ids[0] if (matched and row_ids) else None,
             })
 
         group_ok = not size_mismatch and not any_unmatched
@@ -335,8 +396,13 @@ def allocate(submissions, by_order_id, by_name, by_phone, total_tables=TOTAL_TAB
                     full_reason = f"Could not be matched to the guest list - {a['reason']}"
                     if size_mismatch:
                         full_reason += f"; also, {reasons_for_group[0].lower()}"
+                    flag_type = "culprit"
+                elif size_mismatch:
+                    full_reason = base_reason
+                    flag_type = "mismatch"
                 else:
                     full_reason = base_reason
+                    flag_type = None
                 review_rows.append({
                     "First name": a["first"],
                     "Last name": a["last"],
@@ -344,7 +410,7 @@ def allocate(submissions, by_order_id, by_name, by_phone, total_tables=TOTAL_TAB
                     "Dietary": a["dietary"],
                     "Submitter email": submitter_email,
                     "Reason": full_reason,
-                    "_flag": not a["matched"],  # this specific person is the actual culprit
+                    "_flag": flag_type,
                 })
 
     # ---- Pass 2: assign tables. Groups of 10 get a table to themselves;
@@ -376,6 +442,7 @@ def allocate(submissions, by_order_id, by_name, by_phone, total_tables=TOTAL_TAB
                 "Table number": table_number,
                 "Dietary": a["dietary"],
                 "Submitter email": group["submitter_email"],
+                "_row_id": a["row_id"],  # internal only, used to catch the same guest seated twice
             })
 
     def group_to_review(group, reason):
@@ -387,7 +454,7 @@ def allocate(submissions, by_order_id, by_name, by_phone, total_tables=TOTAL_TAB
                 "Dietary": a["dietary"],
                 "Submitter email": group["submitter_email"],
                 "Reason": reason,
-                "_flag": False,  # systemic issue (e.g. ran out of tables), not this person's fault
+                "_flag": None,  # systemic issue (e.g. ran out of tables), not this person's fault
             })
 
     for group in seatable_groups:
@@ -426,6 +493,32 @@ def allocate(submissions, by_order_id, by_name, by_phone, total_tables=TOTAL_TAB
             f"(no second group of 5 left to pair with) - half-empty, seats 5 of 10."
         )
 
+    # Double-submission check: the same real guest (same guest-list row)
+    # ended up seated at more than one table, most likely because they
+    # were listed in two different preference submissions.
+    row_id_counts = {}
+    row_id_tables = {}
+    for row in seated_rows:
+        rid = row["_row_id"]
+        row_id_counts[rid] = row_id_counts.get(rid, 0) + 1
+        row_id_tables.setdefault(rid, []).append(row["Table number"])
+
+    duplicate_notes = []
+    for row in seated_rows:
+        rid = row["_row_id"]
+        row["_dup"] = row_id_counts.get(rid, 0) > 1
+        if row["_dup"]:
+            all_tables = sorted(set(row_id_tables[rid]))
+            row["Duplicate table(s)"] = ", ".join(str(t) for t in all_tables)
+            duplicate_notes.append(f"{row['First name']} {row['Last name']} - table {row['Table number']}")
+        else:
+            row["Duplicate table(s)"] = ""
+    if duplicate_notes:
+        match_notes.append(
+            "DOUBLE-BOOKED - same guest seated at more than one table (likely listed in two "
+            "submissions), please resolve manually: " + "; ".join(sorted(set(duplicate_notes)))
+        )
+
     return seated_rows, review_rows, tables_used, match_notes, touched_row_ids
 
 
@@ -447,10 +540,13 @@ def find_no_submission_guests(guest_df, touched_row_ids):
 # Step 4: Write output workbook
 # ----------------------------------------------------------------------
 def write_output(seated_rows, review_rows, no_submission_rows, path):
+    # sort the raw list (not the DataFrame) so highlight flags stay
+    # aligned with row order when we apply formatting below
+    seated_rows_sorted = sorted(seated_rows, key=lambda r: (r["Table number"], r["Last name"]))
     seated_df = pd.DataFrame(
-        seated_rows, columns=["First name", "Last name", "Table number", "Dietary", "Submitter email"]
+        seated_rows_sorted,
+        columns=["First name", "Last name", "Table number", "Dietary", "Submitter email", "Duplicate table(s)"],
     )
-    seated_df = seated_df.sort_values(["Table number", "Last name"]).reset_index(drop=True)
 
     review_df = pd.DataFrame(
         review_rows, columns=["First name", "Last name", "Order ID", "Dietary", "Submitter email", "Reason"]
@@ -474,21 +570,40 @@ def write_output(seated_rows, review_rows, no_submission_rows, path):
             length = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
             sheet.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 10), 40)
 
-    # highlight the specific attendee(s) actually responsible for a review
-    # flag (not just everyone in a group held back on their behalf)
+    # ---- Needs Review sheet: highlight the specific attendee(s) actually
+    # responsible for the review flag - yellow for someone who couldn't be
+    # matched at all, orange for a group-size mismatch (no single culprit,
+    # so the whole group is shown this color). Group members held back only
+    # because of someone else's issue stay plain.
     review_sheet = wb["Needs Review"]
-    flag_fill = openpyxl.styles.PatternFill(start_color="FFF6A0", end_color="FFF6A0", fill_type="solid")
-    flags = [r.get("_flag", False) for r in review_rows]
-    for i, flagged in enumerate(flags):
-        if flagged:
+    culprit_fill = openpyxl.styles.PatternFill(start_color="FFF6A0", end_color="FFF6A0", fill_type="solid")
+    mismatch_fill = openpyxl.styles.PatternFill(start_color="FFC896", end_color="FFC896", fill_type="solid")
+    review_fills = {"culprit": culprit_fill, "mismatch": mismatch_fill}
+    for i, r in enumerate(review_rows):
+        fill = review_fills.get(r.get("_flag"))
+        if fill:
             excel_row = i + 2  # +1 for header, +1 for 1-indexing
             for cell in review_sheet[excel_row]:
-                cell.fill = flag_fill
-    # legend, two rows below the data
+                cell.fill = fill
     legend_row = len(review_rows) + 3
-    legend_cell = review_sheet.cell(row=legend_row, column=1, value="Highlighted = this specific person is why the group needs review")
-    legend_cell.fill = flag_fill
-    legend_cell.font = openpyxl.styles.Font(italic=True, size=9)
+    review_sheet.cell(row=legend_row, column=1, value="Yellow = this specific person is why the group needs review").fill = culprit_fill
+    review_sheet.cell(row=legend_row, column=1).font = openpyxl.styles.Font(italic=True, size=9)
+    review_sheet.cell(row=legend_row + 1, column=1, value="Orange = group headcount didn't match what was declared").fill = mismatch_fill
+    review_sheet.cell(row=legend_row + 1, column=1).font = openpyxl.styles.Font(italic=True, size=9)
+
+    # ---- Seating Plan sheet: highlight anyone seated at more than one
+    # table (same guest referenced by two different submissions)
+    seating_sheet = wb["Seating Plan"]
+    dup_fill = openpyxl.styles.PatternFill(start_color="FFADAD", end_color="FFADAD", fill_type="solid")
+    for i, r in enumerate(seated_rows_sorted):
+        if r.get("_dup"):
+            excel_row = i + 2
+            for cell in seating_sheet[excel_row]:
+                cell.fill = dup_fill
+    if any(r.get("_dup") for r in seated_rows_sorted):
+        legend_row = len(seated_rows_sorted) + 3
+        seating_sheet.cell(row=legend_row, column=1, value="Highlighted = this guest is seated at more than one table (double submission) - see 'Duplicate table(s)' column, resolve manually").fill = dup_fill
+        seating_sheet.cell(row=legend_row, column=1).font = openpyxl.styles.Font(italic=True, size=9)
 
     wb.save(path)
 
